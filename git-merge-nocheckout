@@ -1,0 +1,148 @@
+#!/bin/sh
+
+
+warn() {
+	echo "$@" >&2
+}
+
+
+
+current_branch() {
+	git symbolic-ref --short --quiet HEAD
+}
+
+
+
+current_commit() {
+	git rev-parse --quiet HEAD
+}
+
+
+
+do_merge() {
+	current_branch=$1
+	shift
+	target_branch=$1
+	shift
+
+	git read-tree HEAD > /dev/null 2>&1 || {
+		warn "git read-tree failed, aborting!"
+		return
+	}
+	git checkout $target_branch > /dev/null 2>&1 || {
+		warn "git checkout $target_branch failed, aborting!"
+		return
+	}
+
+	# This reset is needed so that we'll redo the merge commit anyway
+	mergebase=$(git merge-base --octopus "$@")
+
+	# When merging only one branch force to redo the commit by resetting
+	# to the parent commit of the tip of that branch.
+	# FIXME: It's more about the number of distinct commits to merge than
+	# the number of branches to merge. Think about two branches on the same
+	# commit.
+	[ $# -lt 2 ] && mergebase=$mergebase^
+
+	git reset --hard $mergebase > /dev/null 2>&1 || {
+		warn "git reset --hard failed, aborting!"
+		return
+	}
+
+	# Special error case for the merge
+	git merge --no-commit --rerere-autoupdate --no-ff "$@" > /dev/null 2>&1
+	merge_ret=$?
+
+	rerere_st=""
+	rerere_rem=""
+	if [ $merge_ret -ne 0 ]; then
+		rerere_st=$(git rerere status)
+		rerere_rem=$(git rerere remaining)
+	fi
+
+	# The merge was successful if it return 0
+	# or if it return 1 and rerere returns nothing
+	if [ "$merge_ret" -eq 0 -o '(' "$merge_ret" -eq 1 -a \
+		-z "$rerere_rem" -a -z "$rerere_st" ')' ]; then
+
+		# Just an informative message
+		[ "$merge_ret" -ne 0 -a -z "$rerere_rem" ] &&
+			echo "rerere has resolved all the conflicts"
+
+		git commit --signoff --no-edit ||
+			warn "git commit failed?!"
+
+	# Anything else is a pure fail and should be aborted
+	else
+		if [ -z "$rerere_rem" ]; then
+			warn -n "The merge has failed so bad it couldn't even "
+			warn "try to run rerere"
+			warn ""
+		else
+			warn "merge failed."
+			warn "rerere mechanism couldn't merge those files:"
+			git rerere remaining >&2
+			warn ""
+		fi
+
+		if [ -n "$rerere_st" -a "$rerere_st" = "$rerere_rem" ]; then
+			warn "However the conflict resolution will be "
+			warn "recorded and reused next time."
+			warn ""
+		fi
+
+		if [ -n "$rerere_st" -a "$rerere_st" != "$rerere_rem" ]; then
+			warn "However the conflict resolution will be "
+			warn "recorded and reused next time for those files:"
+			git rerere status >&2
+			warn ""
+		fi
+
+		warn -n "You should try to merge by yourself "
+		warn "and resolve the conflicts."
+		warn "-> git checkout $target_branch"
+		warn "-> git merge --rerere-autoupdate $@"
+
+		git merge --abort > /dev/null 2>&1 ||
+			warn "emergency merge --abort failed?!"
+		git reset --hard HEAD > /dev/null 2>&1 ||
+			warn "emergency reset --hard failed?!"
+	fi
+
+	git checkout $current_branch > /dev/null 2>&1 || {
+		warn -n "git checkout $current_branch failed. "
+		warn "The repository is left is a weird state. Sorry."
+		return
+	}
+}
+
+
+if [ $# -lt 2 ]; then
+	warn "usage: $0 <target-branch> <commit1> [<commit2> ...]"
+	warn -n "Merge several commit into target-branch "
+	warn "without modifying the index nor the working directory."
+fi
+
+target=$1
+shift
+
+# What was checkout'ed and where we will go afterwards
+costate=$(current_branch) || costate=$(current_commit)
+
+if [ "$costate" = $target ]; then
+	warn "The merge branch '$target' is currently checked out."
+	warn "The repository will be left in detached mode."
+	costate=$(current_commit)
+fi
+
+# The temporary index and working directory for merging
+export GIT_INDEX_FILE=$(mktemp --tmpdir index-XXXXXXXX)
+export GIT_WORK_TREE=$(mktemp --tmpdir --directory gitworktree-XXXXXXXX)
+
+
+do_merge $costate $target "$@"
+
+# Cleanup everything
+rm -fr $GIT_INDEX_FILE $GIT_WORK_TREE
+unset GIT_WORK_TREE
+unset GIT_INDEX_FILE

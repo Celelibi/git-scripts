@@ -1,0 +1,137 @@
+#!/bin/sh
+
+
+commit_id() {
+	git rev-parse --verify --quiet $1
+}
+
+
+
+same_commits() {
+	id1=$(commit_id $1)
+	id2=$(commit_id $2)
+	test -n "$id1" -a "$id1" = "$id2"
+}
+
+
+
+have_one_ancestor() {
+	t=$1
+	shift
+
+	for b in "$@"; do
+		if git merge-base --is-ancestor $t $b; then
+			echo "$t is ancestor of $b, not merging"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+
+
+current_branch() {
+	git symbolic-ref --short --quiet HEAD
+}
+
+
+
+branches_exists() {
+	git rev-parse --verify --quiet $1 > /dev/null
+}
+
+
+
+ls_branch_dirpat() {
+	pat=$1
+	#git rev-parse --symbolic --branches=$pat | sed 's,^refs/heads/,,'
+	(
+		cd $(git rev-parse --git-dir)/refs/heads
+		for f in $pat; do
+			if [ -f $f ]; then
+				echo $f
+			fi
+		done
+	)
+}
+
+
+
+ls_branch() {
+	if [ $# -lt 1 ]; then
+		ls_branch_dirpat '*'
+	else
+		for b in "$@"; do
+			ls_branch_dirpat $b
+		done
+	fi
+}
+
+
+
+target_branch() {
+	dirname=$(dirname $1)/
+	basename=$(basename $1)
+
+	# If the modified branch is "merge" then recreate the upper level of merge
+	if [ $basename = "merge" ]; then
+		dirname=$(dirname $dirname)/
+	fi
+
+	if [ $dirname = "./" ]; then
+		dirname=""
+	fi
+
+
+	echo $dirname"merge"
+}
+
+
+
+branches_to_merge() {
+	dirname=$(dirname $(target_branch $1))/
+
+	if [ $dirname = "./" ]; then
+		dirname=""
+	fi
+
+	ls_branch $dirname'*/merge'
+	ls_branch $dirname'*' | grep -v $dirname"merge"
+}
+
+
+
+merge_branches() {
+	modified=$1
+	target=$(target_branch $modified)
+
+	# Must not modify the current checked out branch
+	curbranch=$(current_branch) && [ "$curbranch" = "$target" ] && exit 0
+
+	# Target branch must exist
+	branches_exists $target || exit 0
+
+	branches=$(branches_to_merge $modified)
+
+	# Target branch shouldn't be an ancestor of any branch to merge
+	# Unless it's already on master
+	if ! same_commits master $target; then
+		have_one_ancestor $target $branches && exit 0
+	fi
+
+	echo git merge-nocheckout $target $branches
+	git merge-nocheckout $target $branches
+}
+
+
+curbranch=""
+
+if [ $# -lt 1 ]; then
+	curbranch=$(current_branch) || exit 0
+else
+	curbranch=$1
+fi
+
+
+merge_branches $curbranch

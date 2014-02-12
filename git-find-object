@@ -1,0 +1,83 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use Git;
+
+# Vaguely based on https://gist.github.com/offby1/8900854
+
+
+
+# Check that the first hash can be the full hash of the second
+sub hash_match {
+	my $h1 = shift;
+	my $h2 = shift;
+
+	return $h1 =~ /^$h2/;
+}
+
+
+
+sub short_object_id {
+	my $objid = shift;
+	return Git::command_oneline(qw(rev-parse --short), $objid);
+}
+
+
+
+# Return the type of the git object identified by $objid
+sub object_type {
+	my $objid = shift;
+	return Git::command_oneline(qw(cat-file -t), $objid);
+}
+
+
+
+# Browse a tree to find the wanted object
+sub check_tree {
+	my $tid = shift;
+	my $searchedid = shift;
+
+	my ($lstree, $ctx) = Git::command_output_pipe(qw(ls-tree -tr
+		--full-tree), $tid);
+
+	while (<$lstree>) {
+		chomp;
+		my ($mode, $type, $hash, $path) = split /\s+/;
+		if (hash_match($hash, $searchedid)) {
+			print short_object_id($tid).": $type $path\n";
+		}
+	}
+	Git::command_close_pipe($lstree, $ctx);
+}
+
+
+sub main {
+	die "usage: git find-object <object> [<git-log arguments ...>]\n"
+		if (@ARGV == 0);
+
+	my $seachedid = shift @ARGV;
+	my $type = object_type($seachedid);
+
+	# No need to traverse the commits if the searched id is a commit
+	if ($type eq "commit") {
+		print "$seachedid is a commit of this repository\n";
+		return;
+	}
+
+	my ($log, $ctx) = Git::command_output_pipe(qw(log --topo-order
+		--pretty=format:%H-%T), @ARGV);
+	while (<$log>) {
+		chomp;
+		my ($cid, $tid) = split /-/;
+		if (hash_match($tid, $seachedid)) {
+			print short_object_id($cid).": tree /\n";
+			last;
+		}
+		check_tree($tid, $seachedid);
+	}
+	Git::command_close_pipe($log, $ctx);
+}
+
+
+main();
