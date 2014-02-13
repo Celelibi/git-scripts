@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<todo version="0.1.20">
+    <note priority="medium" time="1392303495">
+        git-merge-nocheckout
+        <note priority="medium" time="1392303615">
+            Take merge options
+        </note>
+        <note priority="low" time="1392303629">
+            Take commit options
+        </note>
+    </note>
+    <note priority="medium" time="1392303553">
+        git-recreate-merge
+        <note priority="medium" time="1392303734">
+            Don't redo the same commit twice unless --redo is given
+        </note>
+    </note>
+</todo>
