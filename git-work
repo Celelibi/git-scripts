@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+
+# Rewrite commits that were authored or comitted by some pseudonyme with a
+# "professional" name.
+# The github repository must already exist in both the private account and the
+# professional account.
+# The "remote" in the current repository is created if it doesn't exist yet. It
+# uses the HTTP URL to pull the commits and SSH to push the commits.
+#
+# Installation instruction:
+# Put this file somewhere accessible through the $PATH environment variable
+# Add this alias: git config alias.work '!git-work'
+#
+# Configuration instruction:
+# Check the configuration options at the end of: git work -h
+# - Set the username used to select which commits to rewrite:
+#       git config work.private-username Celelibi
+# - Set the username used to rewrite the commits as:
+#       git config work.public-username TheProfessional
+# - Set the email:
+#       git config work.public-email the@professional.com
+
+
+import argparse
+from collections import defaultdict
+import re
+import subprocess
+import urllib.parse
+
+import pygit2
+
+
+# This is set by main
+config = None
+
+signoffpat = r'\nSigned-off-by: %s <[^>]*>\n'
+public_signoffpat = '\nSigned-off-by: %s <%s>\n'
+
+
+
+class GitConfig(object):
+    class OptionDesc(object):
+        def __init__(self, name, dest=None, help=None, fallbacks=[], default=None, raise_not_set=False):
+            if default is not None and raise_not_set:
+                raise ValueError("Setting a default value doesn't make sens with raise_not_set")
+
+            self.name = name
+            self.dest = dest if dest is not None else name
+            self.help = help
+            self.fallbacks = fallbacks
+            self.default = default
+            self.raise_not_set = raise_not_set
+
+    class OptionValues(object):
+        def __init__(self, d):
+            self.__dict__ = d
+
+        def __str__(self):
+            return "OptionValues(%s)" % ", ".join("%s=%r" % i for i in self.__dict__.items())
+
+        __repr__ = __str__
+
+    def __init__(self):
+        self.options = []
+
+    def add_option(self, name, dest=None, help=None, fallbacks=[], default=None, raise_not_set=False):
+        self.options.append(self.OptionDesc(name, dest, help, fallbacks, default, raise_not_set))
+
+    def helpstr(self):
+        optwidth = max(len(o.name) for o in self.options) + 1
+        ret = "Configuration options to set with git config:\n"
+        for opt in self.options:
+            ret += "  " + opt.name.ljust(optwidth)
+            ret += opt.help
+            if opt.fallbacks or opt.default is not None:
+                ret += " ("
+                if opt.fallbacks:
+                    ret += "falls back to the value of: "
+                    ret += ", ".join(opt.fallbacks)
+                if opt.fallbacks and opt.default is not None:
+                    ret += "; "
+                if opt.default is not None:
+                    ret += "defaults to: %r" % opt.default
+                ret += ")"
+            ret += "\n"
+
+        return ret
+
+    def read_config(self, repo):
+        def get(opt):
+            names = [opt.name] + opt.fallbacks
+            for name in names:
+                try:
+                    return repo.config[name]
+                except KeyError:
+                    pass
+
+            if not opt.raise_not_set:
+                return opt.default
+            raise RuntimeError("Required configuration %s not set" % name)
+
+        d = {opt.dest: get(opt) for opt in self.options}
+        return self.OptionValues(d)
+
+
+
+def create_remote(repo):
+    """
+    Create the public remote if it doesn't exist.
+    """
+
+    try:
+        repo.remotes[config.public_remote]
+    except KeyError:
+        pass
+    else:
+        return
+
+    print("Creating remote", config.public_remote)
+
+    try:
+        remote = repo.remotes[config.private_remote]
+    except KeyError:
+        raise RuntimeError("No '%s' remote" % config.private_remote)
+
+    url = urllib.parse.urlparse(remote.url)
+    pathsplit = url.path.split("/")
+    username = pathsplit[1]
+    if username != config.private_username:
+        raise ValueError("Remote '%s' does not belong to user '%s'" % (config.private_remote, config.private_username))
+
+    pathsplit[1] = config.public_username
+    path = "/".join(pathsplit)
+    url = url._replace(path=path)
+    url = urllib.parse.urlunparse(url)
+    pushurl = "git@%s:%s" % (config.public_push_remote_host, path[1:])
+
+    repo.remotes.create(config.public_remote, url)
+    repo.remotes.set_push_url(config.public_remote, pushurl)
+
+
+
+def is_commit_private(c):
+    """
+    Return True iff this commit should be rewritten.
+    """
+
+    if config.private_username in (c.author.name, c.committer.name):
+        return True
+    signoffre = re.compile(signoffpat % config.private_username)
+    return signoffre.search(c.message) is not None
+
+
+
+def select_commits(repo, branches=None):
+    """
+    Select the commits to be rewritten.
+    """
+
+    if branches is None:
+        branches = (b for b in repo.branches.local if not b.startswith(config.local_branch_prefix))
+    branches = (repo.branches[name] for name in branches)
+
+    # For all the commits we may rewrite, record the "children" relationship
+    # between those commits in addition to the "parent" relationship already
+    # recorded in the Commit objects.
+    children = defaultdict(set)
+
+    # The set of nodes we start and stop at.
+    sources = set(repo[b.target] for b in branches)
+
+    pending = sources.copy()
+    while len(pending) > 0:
+        c = pending.pop()
+        if not is_commit_private(c) and len(pending) == 0:
+            break
+
+        for p in c.parents:
+            if len(children[p]) == 0:
+                pending.add(p)
+            children[p].add(c)
+
+    # Build the definitive list of commits to be rewritten.
+    # We only rewrite commits that are private and all their children would be
+    # rewritten.
+    recommits = set()
+
+    pending = sources.copy()
+    while len(pending) > 0:
+        c = pending.pop()
+        if not is_commit_private(c) or c in recommits:
+            continue
+
+        if children[c].issubset(recommits):
+            recommits.add(c)
+            pending.update(set(c.parents))
+
+
+    return recommits, children, sources
+
+
+
+def rewrite_commit(repo, commit, parents):
+    """
+    Modify the commit and return it.
+    """
+
+    print("Rewriting commit:", commit.message.splitlines()[0])
+
+    signoffre = re.compile(signoffpat % config.private_username)
+    signoff = public_signoffpat % (config.public_username, config.public_email)
+
+    author = pygit2.Signature(config.public_username, config.public_email,
+                              commit.author.time, commit.author.offset)
+    committer = pygit2.Signature(config.public_username, config.public_email,
+                                 commit.commit_time, commit.commit_time_offset)
+    msg = signoffre.sub(signoff, commit.message)
+    t = commit.tree.id
+    p = [p.id for p in parents]
+    c = repo.create_commit(None, author, committer, msg, t, p)
+    return repo[c]
+
+
+
+def rewrite_commits(repo, commits, children, branches=None):
+    """
+    Rewrite the commits.
+    """
+
+    if branches is None:
+        branches = (b for b in repo.branches.local if not b.startswith(config.local_branch_prefix))
+    branches = [repo.branches[name] for name in branches]
+    sources = set(repo[b.target] for b in branches)
+
+    # Find the "sinks". i.e. the commits that will be rewritten but whose
+    # parents won't be.
+    sinks = set(c for c in commits if commits.isdisjoint(c.parents))
+
+    # Rewrite all the commits to be rewritten
+    rewritten = {}
+    pending = sinks.copy()
+    while len(pending) > 0:
+        c = pending.pop()
+        parents = [rewritten.get(p, p) for p in c.parents]
+        newcommit = rewrite_commit(repo, c, parents)
+        rewritten[c] = newcommit
+
+        # Rewrite all the children of c
+        for child in children[c]:
+            # Queue child for rewriting only when all its parents that need to
+            # be rewritten have been rewritten
+            p = set(child.parents) & commits
+            if p.issubset(rewritten):
+                pending.add(child)
+
+    # Create new branches work/* that match the original branch
+    pubbranches = {}
+    for b in branches:
+        c = repo[b.target]
+        newc = rewritten.get(c, c)
+        privname = b.branch_name
+        pubname = config.local_branch_prefix + privname
+
+        try:
+            pubb = repo.branches.local[pubname]
+        except KeyError:
+            pubb = repo.branches.local.create(pubname, newc)
+        else:
+            pubb.set_target(newc.id)
+
+        pubbranches[privname] = pubb
+
+    return pubbranches
+
+
+
+def push_branches(repo, branchmap):
+    remote = repo.remotes[config.public_remote]
+
+    specs = ["%s:%s" % (b.branch_name, name) for name, b in branchmap.items()]
+    subprocess.call(["git", "push", "--force", "--set-upstream", config.public_remote] + specs)
+
+
+
+def main():
+    global config
+
+    configdesc = GitConfig()
+    configdesc.add_option("work.private-remote", dest='private_remote',
+                          default="origin", help="Private remote")
+    configdesc.add_option("work.public-remote", dest='public_remote',
+                          default="work", help="Public remote")
+    configdesc.add_option("work.public-push-remote-host", dest='public_push_remote_host',
+                          default="github.com", help="Public remote host name")
+    configdesc.add_option("work.branch-prefix", dest='local_branch_prefix',
+                          default="work/", help="Local branch prefix")
+    configdesc.add_option("work.private-username", dest='private_username',
+                          fallbacks=["user.name"], raise_not_set=True,
+                          help="Username of private commits")
+    configdesc.add_option("work.public-username", dest='public_username',
+                          raise_not_set=True, help="Username to commit with")
+    configdesc.add_option("work.public-email", dest='public_email',
+                          raise_not_set=True, help="Email adress to commit with")
+
+    parser = argparse.ArgumentParser(prog="git work",
+                                     description="Change commits author names for work",
+                                     epilog=configdesc.helpstr(),
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--push", action='store_true',
+                        help="Whether to push the rewritten branches")
+    parser.add_argument("branches", metavar="branch", nargs='*',
+                        help="Branches to turn into work-ready branches")
+    args = parser.parse_args()
+
+    if args.branches == []:
+        args.branches = None
+
+    path = pygit2.discover_repository(".")
+    repo = pygit2.Repository(path)
+
+    config = configdesc.read_config(repo)
+    create_remote(repo)
+    commits, children, sources = select_commits(repo, args.branches)
+    branches = rewrite_commits(repo, commits, children, args.branches)
+
+    if args.push:
+        push_branches(repo, branches)
+
+
+if __name__ == '__main__':
+    main()
