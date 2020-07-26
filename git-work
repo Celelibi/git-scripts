@@ -104,6 +104,22 @@ class GitConfig(object):
 
 
 
+def defaultbranches(repo):
+    if config.ignore_branches is not None:
+        ignored = set(config.ignore_branches.split(" "))
+    else:
+        ignored = set()
+
+    branches = []
+    for b in repo.branches.local:
+        if b.startswith(config.local_branch_prefix) or b in ignored:
+            continue
+        branches.append(b)
+
+    return branches
+
+
+
 def create_remote(repo):
     """
     Create the public remote if it doesn't exist.
@@ -152,14 +168,12 @@ def is_commit_private(c):
 
 
 
-def select_commits(repo, branches=None):
+def select_commits(repo, branches):
     """
     Select the commits to be rewritten.
     """
 
-    if branches is None:
-        branches = (b for b in repo.branches.local if not b.startswith(config.local_branch_prefix))
-    branches = (repo.branches[name] for name in branches)
+    branches = [repo.branches[name] for name in branches]
 
     # For all the commits we may rewrite, record the "children" relationship
     # between those commits in addition to the "parent" relationship already
@@ -222,13 +236,11 @@ def rewrite_commit(repo, commit, parents):
 
 
 
-def rewrite_commits(repo, commits, children, branches=None):
+def rewrite_commits(repo, commits, children, branches):
     """
     Rewrite the commits.
     """
 
-    if branches is None:
-        branches = (b for b in repo.branches.local if not b.startswith(config.local_branch_prefix))
     branches = [repo.branches[name] for name in branches]
     sources = set(repo[b.target] for b in branches)
 
@@ -294,6 +306,8 @@ def main():
                           default="github.com", help="Public remote host name")
     configdesc.add_option("work.branch-prefix", dest='local_branch_prefix',
                           default="work/", help="Local branch prefix")
+    configdesc.add_option("work.ignore-branches", dest='ignore_branches',
+                          help="Space-separated list of branches to ignore")
     configdesc.add_option("work.private-username", dest='private_username',
                           fallbacks=["user.name"], raise_not_set=True,
                           help="Username of private commits")
@@ -312,16 +326,17 @@ def main():
                         help="Branches to turn into work-ready branches")
     args = parser.parse_args()
 
-    if args.branches == []:
-        args.branches = None
-
     path = pygit2.discover_repository(".")
     repo = pygit2.Repository(path)
-
     config = configdesc.read_config(repo)
+
+    branches = args.branches
+    if branches == []:
+        branches = defaultbranches(repo)
+
     create_remote(repo)
-    commits, children, sources = select_commits(repo, args.branches)
-    branches = rewrite_commits(repo, commits, children, args.branches)
+    commits, children, sources = select_commits(repo, branches)
+    branches = rewrite_commits(repo, commits, children, branches)
 
     if args.push:
         push_branches(repo, branches)
